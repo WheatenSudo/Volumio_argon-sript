@@ -1,807 +1,369 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Argon ONE installer for Raspberry Pi OS Bookworm
+# Refactored from the Argon40 installer. This edition targets CHECKDEVICE="one".
+/bin/bash -c "sleep 1; /usr/bin/sudo /bin/date -s \"$(/usr/bin/curl -s --head http://google.com | grep ^Date: | sed 's/Date: //g')\""
 
-echo "*************"
-echo " Argon Setup  "
-echo "*************"
+set -Eeuo pipefail
+IFS=$'\n\t'
 
+readonly ARGON_SERVER="https://download.argon40.com"
+readonly INSTALL_DIR="/etc/argon"
+readonly CONFIG_FILE="/boot/userconfig.txt"
+readonly DAEMON_NAME="argononed"
+readonly DAEMON_SCRIPT="$INSTALL_DIR/argononed.py"
+readonly POWER_BUTTON_SCRIPT="$INSTALL_DIR/argonpowerbutton.py"
+readonly FAN_CONFIG_SCRIPT="$INSTALL_DIR/argonone-fanconfig.sh"
+readonly IR_CONFIG_SCRIPT="$INSTALL_DIR/argonone-ir"
+readonly BLSTR_DAC_SCRIPT="$INSTALL_DIR/argon-blstrdac.sh"
+readonly UNIT_CONFIG_SCRIPT="$INSTALL_DIR/argon-unitconfig.sh"
+readonly STATUS_SCRIPT="$INSTALL_DIR/argon-status.sh"
+readonly VERSION_SCRIPT="$INSTALL_DIR/argon-versioninfo.sh"
+readonly CONFIG_SCRIPT="$INSTALL_DIR/argon-config"
+readonly UNINSTALL_SCRIPT="$INSTALL_DIR/argon-uninstall.sh"
+readonly SHUTDOWN_SCRIPT="/lib/systemd/system-shutdown/argon-shutdown.sh"
+readonly SERVICE_FILE="/lib/systemd/system/argononed.service"
+readonly FAN_CONFIG_FILE="/etc/argononed.conf"
+readonly UNIT_CONFIG_FILE="/etc/argonunits.conf"
+readonly EEPROM_TOOL="/usr/bin/rpi-eeprom-config"
+readonly EEPROM_CONFIG_SCRIPT="$INSTALL_DIR/argonone-eepromconfig.py"
 
-# Check time if need to 'fix'
-NEEDSTIMESYNC=0
-LOCALTIME=$(date -u +%s%N | cut -b1-10)
-GLOBALTIME=$(curl -s 'http://worldtimeapi.org/api/ip.txt' | grep unixtime | cut -b11-20)
-TIMEDIFF=$((GLOBALTIME-LOCALTIME))
+SETUP_MODE="Setup"
+NEEDS_TIME_SYNC=0
 
-# about 26hrs, max timezone difference
-if [ $TIMEDIFF -gt 100000 ]
-then
-	NEEDSTIMESYNC=1
-fi
+log() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+on_error() {
+    local exit_code=$?
+    printf '\nInstallation failed at line %s: %s\n' "$1" "$2" >&2
+    exit "$exit_code"
+}
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 
-argon_time_error() {
-	echo "**********************************************"
-	echo "* WARNING: Device time seems to be incorrect *"
-	echo "* This may cause problems during setup.      *"
-	echo "**********************************************"
-	echo "Possible Network Time Protocol Server issue"
-	echo "Try running the following to correct:"
-    echo " curl -k https://download.argon40.com/tools/setntpserver.sh | bash"
+require_root_tools() {
+    command -v sudo >/dev/null 2>&1 || die "sudo is required."
+    command -v apt-get >/dev/null 2>&1 || die "This installer requires an APT-based operating system."
 }
 
-if [ $NEEDSTIMESYNC -eq 1 ]
-then
-	argon_time_error
-fi
+check_platform() {
+    [[ -r /etc/os-release ]] || die "/etc/os-release was not found."
+    # shellcheck disable=SC1091
+    source /etc/os-release
 
+    case "${ID:-}" in
+        raspbian|debian) ;;
+        *) warn "This script is intended for Raspberry Pi OS/Debian Bookworm; detected ${PRETTY_NAME:-unknown}." ;;
+    esac
 
-# Helper variables
-ARGONDOWNLOADSERVER=https://download.argon40.com
+    if [[ "${VERSION_CODENAME:-}" != "bookworm" && "${VERSION_ID:-}" != "12" ]]; then
+        warn "Bookworm was not detected; detected ${PRETTY_NAME:-unknown}."
+    fi
 
-INSTALLATIONFOLDER=/etc/argon
+    [[ -f "$CONFIG_FILE" ]] || die "$CONFIG_FILE was not found. Is this Raspberry Pi OS Bookworm?"
+}
 
-FLAGFILEV1=$INSTALLATIONFOLDER/flag_v1
+check_time() {
+    local local_time global_time difference
+    local_time=$(date -u +%s)
+    global_time=$(curl -fsSL --connect-timeout 5 --max-time 10 \
+        "https://worldtimeapi.org/api/ip.txt" 2>/dev/null | \
+        awk -F': ' '$1 == "unixtime" {print $2; exit}') || true
 
-versioninfoscript=$INSTALLATIONFOLDER/argon-versioninfo.sh
+    if [[ "$global_time" =~ ^[0-9]+$ ]]; then
+        difference=$((global_time - local_time))
+        (( difference < 0 )) && difference=$((-difference))
+        (( difference > 100000 )) && NEEDS_TIME_SYNC=1
+    else
+        warn "Could not verify the system clock. Continuing installation."
+    fi
+}
 
-uninstallscript=$INSTALLATIONFOLDER/argon-uninstall.sh
-shutdownscript=/lib/systemd/system-shutdown/argon-shutdown.sh
-configscript=$INSTALLATIONFOLDER/argon-config
-unitconfigscript=$INSTALLATIONFOLDER/argon-unitconfig.sh
-blstrdacconfigscript=$INSTALLATIONFOLDER/argon-blstrdac.sh
-statusdisplayscript=$INSTALLATIONFOLDER/argon-status.sh
+show_time_warning() {
+    cat <<'EOF'
+**********************************************
+* WARNING: Device time seems to be incorrect *
+* This may cause problems during setup.      *
+**********************************************
+Possible Network Time Protocol server issue.
+Try:
+  curl -fsSL https://download.argon40.com/tools/setntpserver.sh | sudo bash
+EOF
+}
 
-setupmode="Setup"
-
-if [ -f $configscript ]
-then
-	setupmode="Update"
-	echo "Updating files"
-else
-	sudo mkdir $INSTALLATIONFOLDER
-	sudo chmod 755 $INSTALLATIONFOLDER
-fi
-
-##########
-# Start code lifted from raspi-config
-# is_pifive, get_serial_hw and do_serial_hw based on raspi-config
-
-if [ -e /boot/firmware/config.txt ] ; then
-  FIRMWARE=/firmware
-else
-  FIRMWARE=
-fi
-CONFIG=/boot${FIRMWARE}/config.txt
+is_pi5() {
+    grep -qE '^Revision[[:space:]]*:[[:space:]]*[123][0-9a-fA-F]{2}4[0-9a-fA-F]{3}$' /proc/cpuinfo
+}
 
 set_config_var() {
-    if ! grep -q -E "$1=$2" $3 ; then
-      echo "$1=$2" | sudo tee -a $3 > /dev/null
+    local key=$1 value=$2 file=$3 target tmp
+    target="$key=$value"
+    tmp=$(mktemp)
+
+    if ! grep -q '^\[all\]$' "$file"; then
+        printf '\n[all]\n' | sudo tee -a "$file" >/dev/null
+    fi
+
+    if awk -v target="$target" '
+        /^\[all\]$/ {in_all=1; next}
+        /^\[/ {in_all=0}
+        in_all && $0 == target {found=1}
+        END {exit !found}
+    ' "$file"; then
+        return 0
+    fi
+
+    sudo awk -v target="$target" '
+        /^\[all\]$/ {print; in_all=1; next}
+        /^\[/ && in_all {print target; in_all=0}
+        {print}
+        END {if (in_all) print target}
+    ' "$file" >"$tmp"
+
+    sudo install -m 644 "$tmp" "$file"
+    rm -f "$tmp"
+}
+
+enable_hardware_interfaces() {
+    log "Updating boot configuration..."
+    set_config_var dtparam i2c_arm=on "$CONFIG_FILE"
+    set_config_var enable_uart 1 "$CONFIG_FILE"
+
+    if is_pi5; then
+        set_config_var dtparam nvme "$CONFIG_FILE"
+        set_config_var dtparam=pciex1_gen 3 "$CONFIG_FILE"
+        set_config_var usb_max_current_enable 1 "$CONFIG_FILE"
     fi
 }
 
-is_pifive() {
-  grep -q "^Revision\s*:\s*[ 123][0-9a-fA-F][0-9a-fA-F]4[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]$" /proc/cpuinfo
-  return $?
+package_available() {
+    apt-cache show "$1" >/dev/null 2>&1
 }
 
+install_dependencies() {
+    log "Updating APT package information..."
+    sudo apt-get update
 
-get_serial_hw() {
-  if is_pifive ; then
-    if grep -q -E "dtparam=uart0=off" $CONFIG ; then
-      echo 1
-    elif grep -q -E "dtparam=uart0" $CONFIG ; then
-      echo 0
+    local gpio_package
+    if package_available python3-libgpiod; then
+        gpio_package=python3-libgpiod
+    elif package_available python3-gpiod; then
+        gpio_package=python3-gpiod
     else
-      echo 1
+        die "Neither python3-libgpiod nor python3-gpiod is available from the configured repositories."
     fi
-  else
-    if grep -q -E "^enable_uart=1" $CONFIG ; then
-      echo 0
-    elif grep -q -E "^enable_uart=0" $CONFIG ; then
-      echo 1
-    elif [ -e /dev/serial0 ] ; then
-      echo 0
+
+    log "Using GPIO package: $gpio_package"
+    sudo apt-get install -y \
+        ca-certificates curl wget \
+        "$gpio_package" python3-smbus i2c-tools
+}
+
+download() {
+    local relative_path=$1 destination=$2 mode=${3:-755}
+    local url="$ARGON_SERVER/$relative_path" tmp
+    tmp=$(mktemp)
+
+    log "Downloading $relative_path"
+    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 120 \
+        "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        die "Failed to download $url"
+    fi
+
+    sudo install -D -m "$mode" "$tmp" "$destination"
+    rm -f "$tmp"
+}
+
+prepare_directories() {
+    if [[ -f "$CONFIG_SCRIPT" ]]; then
+        SETUP_MODE="Update"
+    fi
+
+    sudo install -d -m 755 "$INSTALL_DIR"
+    sudo install -d -m 755 /lib/systemd/system /lib/systemd/system-shutdown
+}
+
+download_argon_files() {
+    log "Installing/updating Argon scripts and services..."
+
+    if [[ -x "$EEPROM_TOOL" ]]; then
+        download scripts/argon-rpi-eeprom-config-psu.py "$EEPROM_CONFIG_SCRIPT"
+    fi
+
+    download scripts/argonone-fanconfig.sh "$FAN_CONFIG_SCRIPT"
+    download scripts/argononed.py "$DAEMON_SCRIPT"
+    download scripts/argononed.service "$SERVICE_FILE" 644
+    download scripts/argonone-irconfig.sh "$IR_CONFIG_SCRIPT"
+    download scripts/argon-blstrdac.sh "$BLSTR_DAC_SCRIPT"
+    download scripts/argonstatus.py "$INSTALL_DIR/argonstatus.py"
+    download scripts/argondashboard.py "$INSTALL_DIR/argondashboard.py"
+    download scripts/argon-status.sh "$STATUS_SCRIPT"
+    download scripts/argon-versioninfo.sh "$VERSION_SCRIPT"
+    download scripts/argonsysinfo.py "$INSTALL_DIR/argonsysinfo.py"
+    download scripts/argonregister.py "$INSTALL_DIR/argonregister.py"
+    download scripts/argonpowerbutton-libgpiod.py "$POWER_BUTTON_SCRIPT"
+    download scripts/argon-unitconfig.sh "$UNIT_CONFIG_SCRIPT"
+    download scripts/argon-uninstall.sh "$UNINSTALL_SCRIPT"
+    download scripts/argon-shutdown.sh "$SHUTDOWN_SCRIPT"
+}
+
+create_default_configs() {
+    if [[ ! -e "$FAN_CONFIG_FILE" ]]; then
+        sudo tee "$FAN_CONFIG_FILE" >/dev/null <<'EOF'
+#
+# Argon Fan Speed Configuration (CPU)
+#
+55=30
+60=55
+65=100
+EOF
+        sudo chmod 644 "$FAN_CONFIG_FILE"
+    fi
+
+    if [[ ! -e "$UNIT_CONFIG_FILE" ]]; then
+        printf '#\n' | sudo tee "$UNIT_CONFIG_FILE" >/dev/null
+        sudo chmod 644 "$UNIT_CONFIG_FILE"
+    fi
+}
+
+create_config_tool() {
+    local tmp
+    tmp=$(mktemp)
+
+    cat >"$tmp" <<EOF
+#!/usr/bin/env bash
+set -u
+
+get_number() {
+    local number
+    read -r number
+    if [[ \$number =~ ^[0-9]+$ ]] && (( number >= 0 && number <= 6 )); then
+        printf '%s\\n' "\$number"
     else
-      echo 1
-    fi
-  fi
-}
-
-do_serial_hw() {
-  if [ $1 -eq 0 ] ; then
-    if is_pifive ; then
-      set_config_var dtparam=uart0 on $CONFIG
-    else
-      set_config_var enable_uart 1 $CONFIG
-    fi
-  else
-    if is_pifive ; then
-      sudo sed $CONFIG -i -e "/dtparam=uart0.*/d"
-    else
-      set_config_var enable_uart 0 $CONFIG
-    fi
-  fi
-}
-
-# End code lifted from raspi-config
-##########
-
-# Reuse is_pifive, set_config_var
-set_nvme_default() {
-  if is_pifive ; then
-    set_config_var dtparam nvme $CONFIG
-    set_config_var dtparam=pciex1_gen 3 $CONFIG
-  fi
-}
-set_maxusbcurrent() {
-  if is_pifive ; then
-    #set_config_var max_usb_current 1 $CONFIG
-    set_config_var usb_max_current_enable 1 $CONFIG
-  fi
-}
-
-
-argon_check_pkg() {
-    RESULT=$(dpkg-query -W -f='${Status}\n' "$1" 2> /dev/null | grep "installed")
-
-    if [ "" == "$RESULT" ]; then
-        echo "NG"
-    else
-        echo "OK"
+        printf '%s\\n' -1
     fi
 }
 
+while true; do
+    echo
+    echo "--------------------------"
+    echo "Argon Configuration Tool"
+    "$VERSION_SCRIPT" simple || true
+    echo "--------------------------"
+    echo "Choose Option:"
+    echo "  1. Configure Fan"
+    echo "  2. Configure IR"
+    echo "  3. Configure BLSTR DAC"
+    echo "  4. Configure Units"
+    echo "  5. System Information"
+    echo "  6. Uninstall"
+    echo
+    echo "  0. Exit"
+    printf 'Enter Number (0-6): '
+    selection=\$(get_number)
 
-CHECKDEVICE="one"	# Hardcoded for argonone
-# Check if has RTC
-# Todo for multiple OS
-
-#i2cdetect -y 1 | grep -q ' 51 '
-#if [ $? -eq 0 ]
-#then
-#        CHECKDEVICE="eon"
-#fi
-
-CHECKGPIOMODE="libgpiod" # libgpiod or rpigpio
-
-# Check if Raspbian, Ubuntu, others
-CHECKPLATFORM="Others"
-CHECKPLATFORMVERSION=""
-CHECKPLATFORMVERSIONNUM=""
-if [ -f "/etc/os-release" ]
-then
-	source /etc/os-release
-	if [ "$ID" = "raspbian" ]
-	then
-		CHECKPLATFORM="Raspbian"
-		CHECKPLATFORMVERSION=$VERSION_ID
-	elif [ "$ID" = "debian" ]
-	then
-		# For backwards compatibility, continue using raspbian
-		CHECKPLATFORM="Raspbian"
-		CHECKPLATFORMVERSION=$VERSION_ID
-	elif [ "$ID" = "ubuntu" ]
-	then
-		CHECKPLATFORM="Ubuntu"
-		CHECKPLATFORMVERSION=$VERSION_ID
-	fi
-	echo ${CHECKPLATFORMVERSION} | grep -e "\." > /dev/null
-	if [ $? -eq 0 ]
-	then
-		CHECKPLATFORMVERSIONNUM=`cut -d "." -f2 <<< $CHECKPLATFORMVERSION `
-		CHECKPLATFORMVERSION=`cut -d "." -f1 <<< $CHECKPLATFORMVERSION `
-	fi
-fi
-
-gpiopkg="python3-libgpiod"
-if [ "$CHECKGPIOMODE" = "rpigpio" ]
-then
-	if [ "$CHECKPLATFORM" = "Raspbian" ]
-	then
-		gpiopkg="raspi-gpio python3-rpi.gpio"
-	else
-		gpiopkg="python3-rpi.gpio"
-	fi
-fi
-
-if [ "$CHECKPLATFORM" = "Raspbian" ]
-then
-	if [ "$CHECKDEVICE" = "eon" ]
-	then
-		pkglist=($gpiopkg python3-smbus i2c-tools smartmontools)
-	elif [ "$CHECKDEVICE" = "oneoled" ]
-	then
-		pkglist=($gpiopkg python3-smbus i2c-tools python3-luma.oled)
-	else
-		pkglist=($gpiopkg python3-smbus i2c-tools)
-	fi
-else
-	# Todo handle lgpio
-	# Ubuntu has serial and i2c enabled
-	if [ "$CHECKDEVICE" = "eon" ]
-	then
-		pkglist=($gpiopkg python3-smbus i2c-tools smartmontools)
-	elif [ "$CHECKDEVICE" = "oneoled" ]
-	then
-		pkglist=($gpiopkg python3-smbus i2c-tools python3-luma.oled)
-	else
-		pkglist=($gpiopkg python3-smbus i2c-tools)
-	fi
-fi
-
-echo "Installing/updating dependencies..."
-
-for curpkg in ${pkglist[@]}; do
-	sudo apt-get install -y $curpkg
-	RESULT=$(argon_check_pkg "$curpkg")
-	if [ "NG" == "$RESULT" ]
-	then
-		echo "********************************************************************"
-		echo "Please also connect device to the internet and restart installation."
-		echo "********************************************************************"
-		exit
-	fi
+    case "\$selection" in
+        0) echo "Thank you."; exit 0 ;;
+        1) "$FAN_CONFIG_SCRIPT" ;;
+        2) "$IR_CONFIG_SCRIPT" ;;
+        3) "$BLSTR_DAC_SCRIPT" ;;
+        4) "$UNIT_CONFIG_SCRIPT" ;;
+        5) "$STATUS_SCRIPT" ;;
+        6) "$UNINSTALL_SCRIPT"; exit 0 ;;
+        *) echo "Invalid selection." ;;
+    esac
 done
-
-echo "Updating configuration ..."
-
-# Ubuntu Mate for RPi has raspi-config too
-command -v raspi-config &> /dev/null
-if [ $? -eq 0 ]
-then
-	# Enable i2c and serial
-	sudo raspi-config nonint do_i2c 0
-	if [ ! "$CHECKDEVICE" = "fanhat" ]
-	then
-
-		if [ "$CHECKPLATFORM" = "Raspbian" ]
-		then
-			# bookworm raspi-config prompts user when configuring serial
-			if [ $(get_serial_hw) -eq 1 ]; then
-				do_serial_hw 0
-			fi
-		else
-			sudo raspi-config nonint do_serial 2
-		fi
-	fi
-fi
-
-if [ "$CHECKDEVICE" = "oneoled" ]
-then
-	TMPCONFIGFILE="/dev/shm/tmpconfig.txt"
-	cat $CONFIG | grep -v 'dtoverlay=dwc2' > $TMPCONFIGFILE
-	chmod 755 $TMPCONFIGFILE
-	sudo cp $TMPCONFIGFILE $CONFIG
-	set_config_var dtoverlay=dwc2,dr_mode host $CONFIG
-	rm $TMPCONFIGFILE
-fi
-
-# Additional config for pi5
-set_nvme_default
-set_maxusbcurrent
-
-# Fan Setup
-basename="argonone"
-daemonname=$basename"d"
-irconfigscript=$INSTALLATIONFOLDER/${basename}-ir
-upsconfigscript=$INSTALLATIONFOLDER/${basename}-upsconfig.sh
-fanconfigscript=$INSTALLATIONFOLDER/${basename}-fanconfig.sh
-eepromrpiscript="/usr/bin/rpi-eeprom-config"
-eepromconfigscript=$INSTALLATIONFOLDER/${basename}-eepromconfig.py
-powerbuttonscript=$INSTALLATIONFOLDER/$daemonname.py
-unitconfigfile=/etc/argonunits.conf
-daemonconfigfile=/etc/$daemonname.conf
-daemonfanservice=/lib/systemd/system/$daemonname.service
-
-daemonhddconfigfile=/etc/${daemonname}-hdd.conf
-
-echo "Installing/Updating scripts and services ..."
-
-if [ -f "$eepromrpiscript" ]
-then
-	# EEPROM Config Script
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argon-rpi-eeprom-config-psu.py -O $eepromconfigscript --quiet
-	sudo chmod 755 $eepromconfigscript
-fi
-
-if is_pifive
-then
-	# UPS Config Script
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argonone-upsconfig.sh -O $upsconfigscript --quiet
-	sudo chmod 755 $upsconfigscript
-fi
-
-for TMPDIRECTORY in "/lib/systemd/system" "/lib/systemd/system-shutdown"
-do
-	sudo mkdir -p "$TMPDIRECTORY"
-	sudo chmod 755 $TMPDIRECTORY
-	sudo chown root:root "$TMPDIRECTORY"
-done
-
-# Fan Config Script
-sudo wget $ARGONDOWNLOADSERVER/scripts/argonone-fanconfig.sh -O $fanconfigscript --quiet
-sudo chmod 755 $fanconfigscript
-
-
-# Fan Daemon/Service Files
-sudo wget $ARGONDOWNLOADSERVER/scripts/argononed.py -O $powerbuttonscript --quiet
-if [ "$CHECKDEVICE" = "oneoled" ]
-then
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argononeoledd.service -O $daemonfanservice --quiet
-else
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argononed.service -O $daemonfanservice --quiet
-fi
-sudo chmod 644 $daemonfanservice
-
-if [ ! "$CHECKDEVICE" = "fanhat" ]
-then
-	# IR Files
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argonone-irconfig.sh -O $irconfigscript --quiet
-	sudo chmod 755 $irconfigscript
-
-	if [ ! "$CHECKDEVICE" = "eon" ]
-	then
-		sudo wget $ARGONDOWNLOADSERVER/scripts/argon-blstrdac.sh -O $blstrdacconfigscript --quiet
-		sudo chmod 755 $blstrdacconfigscript
-	fi
-fi
-
-# Other utility scripts
-sudo wget $ARGONDOWNLOADSERVER/scripts/argonstatus.py -O $INSTALLATIONFOLDER/argonstatus.py --quiet
-sudo wget $ARGONDOWNLOADSERVER/scripts/argondashboard.py -O $INSTALLATIONFOLDER/argondashboard.py --quiet
-sudo wget $ARGONDOWNLOADSERVER/scripts/argon-status.sh -O $statusdisplayscript --quiet
-sudo chmod 755 $statusdisplayscript
-
-
-sudo wget $ARGONDOWNLOADSERVER/scripts/argon-versioninfo.sh -O $versioninfoscript --quiet
-sudo chmod 755 $versioninfoscript
-
-sudo wget $ARGONDOWNLOADSERVER/scripts/argonsysinfo.py -O $INSTALLATIONFOLDER/argonsysinfo.py --quiet
-
-if [ -f "$FLAGFILEV1" ]
-then
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argonregister-v1.py -O $INSTALLATIONFOLDER/argonregister.py --quiet
-else
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argonregister.py -O $INSTALLATIONFOLDER/argonregister.py --quiet
-fi
-
-sudo wget "$ARGONDOWNLOADSERVER/scripts/argonpowerbutton-${CHECKGPIOMODE}.py" -O $INSTALLATIONFOLDER/argonpowerbutton.py --quiet
-
-sudo wget $ARGONDOWNLOADSERVER/scripts/argononed.py -O $powerbuttonscript --quiet
-
-sudo wget $ARGONDOWNLOADSERVER/scripts/argon-unitconfig.sh -O $unitconfigscript --quiet
-sudo chmod 755 $unitconfigscript
-
-
-# Generate default Fan config file if non-existent
-if [ ! -f $daemonconfigfile ]; then
-	sudo touch $daemonconfigfile
-	sudo chmod 666 $daemonconfigfile
-
-	echo '#' >> $daemonconfigfile
-	echo '# Argon Fan Speed Configuration (CPU)' >> $daemonconfigfile
-	echo '#' >> $daemonconfigfile
-	echo '55=30' >> $daemonconfigfile
-	echo '60=55' >> $daemonconfigfile
-	echo '65=100' >> $daemonconfigfile
-fi
-
-if [ "$CHECKDEVICE" = "eon" ]
-then
-	if [ ! -f $daemonhddconfigfile ]; then
-		sudo touch $daemonhddconfigfile
-		sudo chmod 666 $daemonhddconfigfile
-
-		echo '#' >> $daemonhddconfigfile
-		echo '# Argon Fan Speed Configuration (HDD)' >> $daemonhddconfigfile
-		echo '#' >> $daemonhddconfigfile
-		echo '35=30' >> $daemonhddconfigfile
-		echo '40=55' >> $daemonhddconfigfile
-		echo '45=100' >> $daemonhddconfigfile
-	fi
-fi
-
-# Generate default Unit config file if non-existent
-if [ ! -f $unitconfigfile ]; then
-	sudo touch $unitconfigfile
-	sudo chmod 666 $unitconfigfile
-
-	echo '#' >> $unitconfigfile
-fi
-
-
-if [ "$CHECKDEVICE" = "eon" ]
-then
-	# RTC Setup
-	basename="argoneon"
-	daemonname=$basename"d"
-
-	rtcconfigfile=/etc/argoneonrtc.conf
-	rtcconfigscript=$INSTALLATIONFOLDER/${basename}-rtcconfig.sh
-	daemonrtcservice=/lib/systemd/system/$daemonname.service
-	rtcdaemonscript=$INSTALLATIONFOLDER/$daemonname.py
-
-	# Generate default RTC config file if non-existent
-	if [ ! -f $rtcconfigfile ]; then
-		sudo touch $rtcconfigfile
-		sudo chmod 666 $rtcconfigfile
-
-		echo '#' >> $rtcconfigfile
-		echo '# Argon RTC Configuration' >> $rtcconfigfile
-		echo '#' >> $rtcconfigfile
-	fi
-
-	# RTC Config Script
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argoneon-rtcconfig.sh -O $rtcconfigscript --quiet
-	sudo chmod 755 $rtcconfigscript
-
-	# RTC Daemon/Service Files
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argonrtc.py -O $INSTALLATIONFOLDER/argonrtc.py --quiet
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argoneond.py -O $rtcdaemonscript --quiet
-	sudo wget $ARGONDOWNLOADSERVER/scripts/argoneond.service -O $daemonrtcservice --quiet
-	sudo chmod 644 $daemonrtcservice
-fi
-
-
-if [ "$CHECKDEVICE" = "eon" ] || [ "$CHECKDEVICE" = "oneoled" ]
-then
-	# OLED Setup
-	basename="argoneon"
-	daemonname=$basename"d"
-
-	oledconfigscript=$INSTALLATIONFOLDER/${basename}-oledconfig.sh
-	oledlibscript=$INSTALLATIONFOLDER/${basename}oled.py
-	oledconfigfile=/etc/argoneonoled.conf
-
-	# Generate default OLED config file if non-existent
-	if [ ! -f $oledconfigfile ]; then
-		sudo touch $oledconfigfile
-		sudo chmod 666 $oledconfigfile
-
-		echo '#' >> $oledconfigfile
-		echo '# Argon OLED Configuration' >> $oledconfigfile
-		echo '#' >> $oledconfigfile
-		echo 'switchduration=30' >> $oledconfigfile
-		if [ "$CHECKDEVICE" = "eon" ]
-		then
-			echo 'screenlist="clock cpu storage raid ram temp ip"' >> $oledconfigfile
-		else
-			echo 'screenlist="logo1v5 clock cpu storage ram temp ip"' >> $oledconfigfile
-		fi
-	fi
-
-	# OLED Config Script
-	if [ "$CHECKDEVICE" = "eon" ]
-	then
-		sudo wget $ARGONDOWNLOADSERVER/scripts/argoneonoled.py -O $oledlibscript --quiet
-		sudo wget $ARGONDOWNLOADSERVER/scripts/argoneon-oledconfig.sh -O $oledconfigscript --quiet
-	else
-		sudo wget $ARGONDOWNLOADSERVER/scripts/argononeoled.py -O $oledlibscript --quiet
-		sudo wget $ARGONDOWNLOADSERVER/scripts/argonone-oledconfig.sh -O $oledconfigscript --quiet
-	fi
-	sudo chmod 755 $oledconfigscript
-
-	if [ ! -d $INSTALLATIONFOLDER/oled ]
-	then
-		sudo mkdir $INSTALLATIONFOLDER/oled
-	fi
-
-	for binfile in font8x6 font16x12 font32x24 font64x48 font16x8 font24x16 font48x32 bgdefault bgram bgip bgtemp bgcpu bgraid bgstorage bgtime
-	do
-		sudo wget $ARGONDOWNLOADSERVER/oled/${binfile}.bin -O $INSTALLATIONFOLDER/oled/${binfile}.bin --quiet
-	done
-
-	if [ "$CHECKDEVICE" = "oneoled" ]
-	then
-		for binfile in logo1v5
-		do
-			sudo wget $ARGONDOWNLOADSERVER/oled/${binfile}.bin -O $INSTALLATIONFOLDER/oled/${binfile}.bin --quiet
-		done
-	fi
-fi
-
-
-# Argon Uninstall Script
-sudo wget $ARGONDOWNLOADSERVER/scripts/argon-uninstall.sh -O $uninstallscript --quiet
-sudo chmod 755 $uninstallscript
-
-# Argon Shutdown script
-sudo wget $ARGONDOWNLOADSERVER/scripts/argon-shutdown.sh -O $shutdownscript --quiet
-sudo chmod 755 $shutdownscript
-
-# Argon Config Script
-if [ -f $configscript ]; then
-	sudo rm $configscript
-fi
-sudo touch $configscript
-
-# To ensure we can write the following lines
-sudo chmod 666 $configscript
-
-echo '#!/bin/bash' >> $configscript
-
-echo 'echo "--------------------------"' >> $configscript
-echo 'echo "Argon Configuration Tool"' >> $configscript
-echo "$versioninfoscript simple" >> $configscript
-echo 'echo "--------------------------"' >> $configscript
-
-echo 'get_number () {' >> $configscript
-echo '	read curnumber' >> $configscript
-echo '	if [ -z "$curnumber" ]' >> $configscript
-echo '	then' >> $configscript
-echo '		echo "-2"' >> $configscript
-echo '		return' >> $configscript
-echo '	elif [[ $curnumber =~ ^[+-]?[0-9]+$ ]]' >> $configscript
-echo '	then' >> $configscript
-echo '		if [ $curnumber -lt 0 ]' >> $configscript
-echo '		then' >> $configscript
-echo '			echo "-1"' >> $configscript
-echo '			return' >> $configscript
-echo '		elif [ $curnumber -gt 100 ]' >> $configscript
-echo '		then' >> $configscript
-echo '			echo "-1"' >> $configscript
-echo '			return' >> $configscript
-echo '		fi	' >> $configscript
-echo '		echo $curnumber' >> $configscript
-echo '		return' >> $configscript
-echo '	fi' >> $configscript
-echo '	echo "-1"' >> $configscript
-echo '	return' >> $configscript
-echo '}' >> $configscript
-echo '' >> $configscript
-
-echo 'mainloopflag=1' >> $configscript
-echo 'while [ $mainloopflag -eq 1 ]' >> $configscript
-echo 'do' >> $configscript
-echo '	echo' >> $configscript
-echo '	echo "Choose Option:"' >> $configscript
-if [ ! "$CHECKDEVICE" = "oneoled" ]
-then
-	echo '	echo "  1. Configure Fan"' >> $configscript
-fi
-
-blstrdacoption=0
-
-if [ "$CHECKDEVICE" = "fanhat" ]
-then
-	uninstalloption="4"
-else
-	if [ ! "$CHECKDEVICE" = "oneoled" ]
-	then
-		echo '	echo "  2. Configure IR"' >> $configscript
-	fi
-	if [ "$CHECKDEVICE" = "eon" ]
-	then
-		# ArgonEON Has RTC
-		echo '	echo "  3. Configure RTC and/or Schedule"' >> $configscript
-		echo '	echo "  4. Configure OLED"' >> $configscript
-		uninstalloption="7"
-	elif [ "$CHECKDEVICE" = "oneoled" ]
-	then
-		echo '	echo "  1. Configure OLED"' >> $configscript
-		echo '	echo "  2. Argon Industria UPS"' >> $configscript
-		uninstalloption="5"
-	elif is_pifive
-	then
-		echo '	echo "  3. Argon Industria UPS"' >> $configscript
-		uninstalloption="7"
-		blstrdacoption=$(($uninstalloption-3))
-		echo "	echo \"  $blstrdacoption. Configure BLSTR DAC (v3/v5 only)\"" >> $configscript
-	else
-		uninstalloption="6"
-		blstrdacoption=$(($uninstalloption-3))
-		echo "	echo \"  $blstrdacoption. Configure BLSTR DAC (v3 only)\"" >> $configscript
-	fi
-fi
-
-unitsoption=$(($uninstalloption-2))
-echo "	echo \"  $unitsoption. Configure Units\"" >> $configscript
-statusoption=$(($uninstalloption-1))
-echo "	echo \"  $statusoption. System Information\"" >> $configscript
-
-echo "	echo \"  $uninstalloption. Uninstall\"" >> $configscript
-echo '	echo ""' >> $configscript
-echo '	echo "  0. Exit"' >> $configscript
-echo "	echo -n \"Enter Number (0-$uninstalloption):\"" >> $configscript
-echo '	newmode=$( get_number )' >> $configscript
-
-
-echo '	if [ $newmode -eq 0 ]' >> $configscript
-echo '	then' >> $configscript
-echo '		echo "Thank you."' >> $configscript
-echo '		mainloopflag=0' >> $configscript
-echo '	elif [ $newmode -eq 1 ]' >> $configscript
-echo '	then' >> $configscript
-
-# Option 1
-if [ "$CHECKDEVICE" = "eon" ]
-then
-	echo '		echo "Choose Triggers:"' >> $configscript
-	echo '		echo "  1. CPU Temperature"' >> $configscript
-	echo '		echo "  2. HDD Temperature"' >> $configscript
-	echo '		echo ""' >> $configscript
-	echo '		echo "  0. Cancel"' >> $configscript
-	echo "		echo -n \"Enter Number (0-2):\"" >> $configscript
-	echo '		submode=$( get_number )' >> $configscript
-
-	echo '		if [ $submode -eq 1 ]' >> $configscript
-	echo '		then' >> $configscript
-	echo "			$fanconfigscript" >> $configscript
-	echo '			mainloopflag=0' >> $configscript
-	echo '		elif [ $submode -eq 2 ]' >> $configscript
-	echo '		then' >> $configscript
-	echo "			$fanconfigscript hdd" >> $configscript
-	echo '			mainloopflag=0' >> $configscript
-	echo '		fi' >> $configscript
-elif [ "$CHECKDEVICE" = "oneoled" ]
-then
-	echo "		$oledconfigscript" >> $configscript
-	echo '		mainloopflag=0' >> $configscript
-else
-	echo "		$fanconfigscript" >> $configscript
-	echo '		mainloopflag=0' >> $configscript
-fi
-
-# Options 2  onwards
-if [ ! "$CHECKDEVICE" = "fanhat" ]
-then
-	if [ "$CHECKDEVICE" = "oneoled" ]
-	then
-		echo '	elif [ $newmode -eq 2 ]' >> $configscript
-		echo '	then' >> $configscript
-		echo "		$upsconfigscript" >> $configscript
-		#echo '		mainloopflag=0' >> $configscript
-
-	else
-		echo '	elif [ $newmode -eq 2 ]' >> $configscript
-		echo '	then' >> $configscript
-		echo "		$irconfigscript" >> $configscript
-		#echo '		mainloopflag=0' >> $configscript
-
-		if [ "$CHECKDEVICE" = "eon" ]
-		then
-			echo '	elif [ $newmode -eq 3 ]' >> $configscript
-			echo '	then' >> $configscript
-			echo "		$rtcconfigscript" >> $configscript
-			#echo '		mainloopflag=0' >> $configscript
-			echo '	elif [ $newmode -eq 4 ]' >> $configscript
-			echo '	then' >> $configscript
-			echo "		$oledconfigscript" >> $configscript
-			#echo '		mainloopflag=0' >> $configscript
-		elif is_pifive
-		then
-			echo '	elif [ $newmode -eq 3 ]' >> $configscript
-			echo '	then' >> $configscript
-			echo "		$upsconfigscript" >> $configscript
-			#echo '		mainloopflag=0' >> $configscript
-		fi
-
-		if [ $blstrdacoption -gt 0 ]
-		then
-			echo "	elif [ \$newmode -eq $blstrdacoption ]" >> $configscript
-			echo '	then' >> $configscript
-			echo "		$blstrdacconfigscript" >> $configscript
-			#echo '		mainloopflag=0' >> $configscript
-		fi
-	fi
-fi
-
-# Standard options
-echo "	elif [ \$newmode -eq $unitsoption ]" >> $configscript
-echo '	then' >> $configscript
-echo "		$unitconfigscript" >> $configscript
-#echo '		mainloopflag=0' >> $configscript
-
-echo "	elif [ \$newmode -eq $statusoption ]" >> $configscript
-echo '	then' >> $configscript
-echo "		$statusdisplayscript" >> $configscript
-
-echo "	elif [ \$newmode -eq $uninstalloption ]" >> $configscript
-echo '	then' >> $configscript
-echo "		$uninstallscript" >> $configscript
-echo '		mainloopflag=0' >> $configscript
-echo '	fi' >> $configscript
-echo 'done' >> $configscript
-
-sudo chmod 755 $configscript
-
-# Desktop Icon
-destfoldername=$USERNAME
-if [ -z "$destfoldername" ]
-then
-	destfoldername=$USER
-fi
-if [ -z "$destfoldername" ]
-then
-	destfoldername="pi"
-fi
-
-shortcutfile="/home/$destfoldername/Desktop/argonone-config.desktop"
-if [ -d "/home/$destfoldername/Desktop" ]
-then
-	echo "Creating/Updating Desktop Elements ..."
-
-	terminalcmd="lxterminal --working-directory=/home/$destfoldername/ -t"
-	if  [ -f "/home/$destfoldername/.twisteros.twid" ]
-	then
-		terminalcmd="xfce4-terminal --default-working-directory=/home/$destfoldername/ -T"
-	fi
-	imagefile=ar1config.png
-	if [ "$CHECKDEVICE" = "eon" ]
-	then
-		imagefile=argoneon.png
-	fi
-	sudo wget https://download.argon40.com/$imagefile -O /usr/share/pixmaps/$imagefile --quiet
-	if [ -f $shortcutfile ]; then
-		sudo rm $shortcutfile
-	fi
-
-	# Create Shortcuts
-	echo "[Desktop Entry]" > $shortcutfile
-	echo "Name=Argon Configuration" >> $shortcutfile
-	echo "Comment=Argon Configuration" >> $shortcutfile
-	echo "Icon=/usr/share/pixmaps/$imagefile" >> $shortcutfile
-	echo 'Exec='$terminalcmd' "Argon Configuration" -e '$configscript >> $shortcutfile
-	echo "Type=Application" >> $shortcutfile
-	echo "Encoding=UTF-8" >> $shortcutfile
-	echo "Terminal=false" >> $shortcutfile
-	echo "Categories=None;" >> $shortcutfile
-	chmod 755 $shortcutfile
-fi
-
-configcmd="$(basename -- $configscript)"
-
-echo "Initializing Services ..."
-
-if [ "$setupmode" = "Setup" ]
-then
-	if [ -f "/usr/bin/$configcmd" ]
-	then
-		sudo rm /usr/bin/$configcmd
-	fi
-	sudo ln -s $configscript /usr/bin/$configcmd
-
-	if [ "$CHECKDEVICE" = "one" ] || [ "$CHECKDEVICE" = "oneoled" ]
-	then
-		sudo ln -s $configscript /usr/bin/argonone-config
-		sudo ln -s $uninstallscript /usr/bin/argonone-uninstall
-		sudo ln -s $irconfigscript /usr/bin/argonone-ir
-	elif [ "$CHECKDEVICE" = "fanhat" ]
-	then
-		sudo ln -s $configscript /usr/bin/argonone-config
-		sudo ln -s $uninstallscript /usr/bin/argonone-uninstall
-	fi
-
-	# Enable and Start Service(s)
-	sudo systemctl daemon-reload
-	sudo systemctl enable argononed.service
-	sudo systemctl start argononed.service
-	if [ "$CHECKDEVICE" = "eon" ]
-	then
-		sudo systemctl enable argoneond.service
-		sudo systemctl start argoneond.service
-	fi
-else
-	sudo systemctl daemon-reload
-	sudo systemctl restart argononed.service
-	if [ "$CHECKDEVICE" = "eon" ]
-	then
-		sudo systemctl restart argoneond.service
-	fi
-fi
-
-
-echo "*********************"
-echo "  $setupmode Completed "
-echo "*********************"
-$versioninfoscript
-echo
-echo "Use '$configcmd' to configure device"
-echo
-
-
-
-if [ $NEEDSTIMESYNC -eq 1 ]
-then
-	argon_time_error
-fi
-
+EOF
+
+    sudo install -m 755 "$tmp" "$CONFIG_SCRIPT"
+    rm -f "$tmp"
+}
+
+create_links() {
+    sudo ln -sfn "$CONFIG_SCRIPT" /usr/bin/argon-config
+    sudo ln -sfn "$CONFIG_SCRIPT" /usr/bin/argonone-config
+    sudo ln -sfn "$UNINSTALL_SCRIPT" /usr/bin/argonone-uninstall
+    sudo ln -sfn "$IR_CONFIG_SCRIPT" /usr/bin/argonone-ir
+}
+
+create_desktop_shortcut() {
+    local target_user home_dir desktop icon shortcut tmp
+    target_user=${SUDO_USER:-${USER:-}}
+    [[ -n "$target_user" ]] || return 0
+
+    home_dir=$(getent passwd "$target_user" | cut -d: -f6)
+    [[ -n "$home_dir" ]] || return 0
+    desktop="$home_dir/Desktop"
+    [[ -d "$desktop" ]] || return 0
+
+    icon=/usr/share/pixmaps/ar1config.png
+    shortcut="$desktop/argonone-config.desktop"
+    download ar1config.png "$icon" 644
+
+    tmp=$(mktemp)
+    cat >"$tmp" <<EOF
+[Desktop Entry]
+Name=Argon Configuration
+Comment=Argon Configuration
+Icon=$icon
+Exec=argonone-config
+Type=Application
+Terminal=true
+Categories=Settings;System;
+EOF
+    sudo install -m 755 -o "$target_user" -g "$(id -gn "$target_user")" "$tmp" "$shortcut"
+    rm -f "$tmp"
+}
+
+start_service() {
+    log "Initializing service..."
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now argononed.service
+    sudo systemctl --no-pager --full status argononed.service || true
+}
+
+update_eeprom() {
+    if [[ -x "$EEPROM_TOOL" && -x "$EEPROM_CONFIG_SCRIPT" ]]; then
+        log "Checking Raspberry Pi EEPROM..."
+        sudo rpi-eeprom-update || warn "EEPROM check/update returned a non-zero status."
+        sudo "$EEPROM_CONFIG_SCRIPT" || warn "Argon EEPROM configuration did not complete successfully."
+    fi
+}
+
+main() {
+    echo "*************"
+    echo " Argon Setup "
+    echo " Bookworm   "
+    echo "*************"
+
+    require_root_tools
+    check_platform
+    check_time
+    (( NEEDS_TIME_SYNC == 1 )) && show_time_warning
+
+    install_dependencies
+    prepare_directories
+    enable_hardware_interfaces
+    download_argon_files
+    create_default_configs
+    create_config_tool
+    create_links
+    create_desktop_shortcut
+    start_service
+    update_eeprom
+
+    echo
+    echo "*********************"
+    echo "  $SETUP_MODE Completed"
+    echo "*********************"
+    "$VERSION_SCRIPT" || true
+    echo
+    echo "Use 'argonone-config' to configure the device."
+    echo "A reboot is recommended so boot configuration changes take effect:"
+    echo "  sudo reboot"
+
+    
+}
+
+main "$@"
