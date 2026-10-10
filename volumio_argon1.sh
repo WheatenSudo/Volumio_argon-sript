@@ -359,7 +359,7 @@ main() {
     echo "*********************"
     "$VERSION_SCRIPT" || true
     echo
-    echo "Use 'argonone-config' to configure the device."
+    echo "Use 'sudo argonone-config' to configure the device."
     echo "A reboot is recommended so boot configuration changes take effect:"
     echo "  sudo reboot"
 
